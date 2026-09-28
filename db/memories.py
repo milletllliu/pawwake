@@ -416,6 +416,20 @@ def _effective_days_ago(event_date, created_at, now_utc):
     return max(0.0, (now_utc - created_at).total_seconds() / 86400.0)
 
 
+def _anchored_semantic_normalize(scores: dict, threshold: float) -> dict:
+    """语义轴归一化：下界取批内最低，上界不低于语义阈值。
+    池里有候选过阈值时与 min-max 一致；全弱池不再把最高项拉满"""
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    min_v = min(vals)
+    max_v = max(max(vals), threshold)
+    spread = max_v - min_v
+    if spread == 0:
+        return {k: 0.0 if max_v == 0 else 1.0 for k in scores}
+    return {k: (v - min_v) / spread for k, v in scores.items()}
+
+
 async def search_memories_hybrid(
     query: str,
     limit: int = 10,
@@ -448,9 +462,24 @@ async def search_memories_hybrid(
                 params.append(kw)
 
             hit_count_expr = " + ".join(case_parts)
-            max_hits = len(keywords)
             where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
             where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
+
+            # IDF：ln((活跃总数+1)/(df+1))+1，df 与命中同一 ILIKE 口径；
+            # df=0 的词谁都命中不了，权重记 0、不进分母，全为 0 时无候选
+            df_cols = ", ".join(
+                f"COUNT(*) FILTER (WHERE content ILIKE '%' || ${i+1} || '%') AS df_{i}"
+                for i in range(len(keywords))
+            )
+            idf_cols = ", ".join(
+                f"CASE WHEN df_{i} > 0 THEN LN((total + 1)::float8 / (df_{i} + 1)) + 1 ELSE 0 END AS w_{i}"
+                for i in range(len(keywords))
+            )
+            weighted_expr = " + ".join(
+                f"CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN w_{i} ELSE 0 END"
+                for i in range(len(keywords))
+            )
+            weight_total_expr = " + ".join(f"w_{i}" for i in range(len(keywords)))
 
             if excluded_ids:
                 exclude_idx = len(params) + 1
@@ -461,10 +490,17 @@ async def search_memories_hybrid(
             params.append(limit * 3)
 
             kw_sql = f"""
+                WITH kw_df AS (
+                    SELECT COUNT(*) AS total, {df_cols}
+                    FROM memories
+                    WHERE is_active = TRUE
+                ), kw_idf AS (
+                    SELECT {idf_cols} FROM kw_df
+                )
                 SELECT id, content, importance, created_at, event_date,
                        ({hit_count_expr}) AS hit_count,
-                       ({hit_count_expr})::float / {max_hits}.0 AS kw_score
-                FROM memories
+                       ({weighted_expr}) / NULLIF({weight_total_expr}, 0) AS kw_score
+                FROM memories CROSS JOIN kw_idf
                 WHERE {where_clause}
                 ORDER BY kw_score DESC
                 LIMIT ${limit_idx}
@@ -559,8 +595,12 @@ async def search_memories_hybrid(
             return ([], search_mode) if return_mode else []
 
         # ---- 归一化 + 加权 ----
-        kw_norm = db_search._min_max_normalize({mid: v['kw_score'] for mid, v in candidates.items()})
-        sem_norm = db_search._min_max_normalize({mid: v['similarity'] for mid, v in candidates.items()})
+        # 关键词轴直接用 IDF 覆盖率（0~1），不做批内拉伸，泛词池不会被顶满
+        kw_norm = {mid: v['kw_score'] for mid, v in candidates.items()}
+        sem_norm = _anchored_semantic_normalize(
+            {mid: v['similarity'] for mid, v in candidates.items()},
+            shared.MEMORY_SEMANTIC_THRESHOLD,
+        )
 
         now = datetime.now(dt_timezone.utc)
         final = []
@@ -770,17 +810,32 @@ async def get_extraction_candidates(
 
 
 async def get_pending_memory_embedding_count():
-    """查询还没有embedding的记忆数量"""
+    """查询还没有embedding的活跃记忆数量"""
     embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+            f"SELECT COUNT(*) FROM memories WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL"
         )
+
+
+async def get_active_memory_embedding_counts():
+    """Dashboard 只展示活跃记忆的向量覆盖率。"""
+    embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(f"""
+            SELECT COUNT(*) FILTER (WHERE {embedding_column} IS NOT NULL) AS cumulative_embedded,
+                   COUNT(*) FILTER (WHERE {embedding_column} IS NULL) AS remaining
+            FROM memories WHERE is_active = TRUE AND content IS NOT NULL
+        """)
+    return dict(row)
 
 
 async def backfill_memory_embeddings(batch_size: int = 20):
     """给已有记忆补算embedding（没有embedding的记忆）"""
+    if not db_search.embedding_ready():
+        return 0
     if not shared.EMBEDDING_API_KEY:
         print("⚠️ EMBEDDING_API_KEY 未设置，无法补算embedding")
         return 0
@@ -792,19 +847,21 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT id, content FROM memories
-            WHERE {embedding_column} IS NULL AND content IS NOT NULL
+            WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL
             ORDER BY id
             LIMIT $1
         """, batch_size)
 
     if not rows:
-        print("✅ 所有记忆已有embedding，无需补算")
+        print("✅ 所有活跃记忆已有embedding，无需补算")
         return 0
 
     print(f"🔄 开始补算记忆embedding... 本批 {len(rows)} 条")
 
     async with pool.acquire() as conn:
         for row in rows:
+            if not db_search.embedding_ready():
+                break
             try:
                 embedding = await db_search.compute_embedding(row['content'] or '')
                 if embedding:
@@ -816,7 +873,7 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     # 检查剩余
     async with pool.acquire() as conn:
         remaining = await conn.fetchval(
-            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+            f"SELECT COUNT(*) FROM memories WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL"
         )
 
     print(f"✅ 本批补算完成：{total_updated}/{len(rows)} 条成功" + (f"，剩余 {remaining} 条待处理" if remaining > 0 else ""))
